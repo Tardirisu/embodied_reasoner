@@ -13,6 +13,64 @@ from tqdm import tqdm
 import numpy as np
 import cv2, json
 
+class MCPStateTracker:
+    """Track multi-turn clarification state with minimal structure."""
+    STATE_IDLE = "IDLE"
+    STATE_AMBIGUITY_DETECTED = "AMBIGUITY_DETECTED"
+    STATE_CLARIFYING = "CLARIFYING"
+    STATE_PARTIALLY_RESOLVED = "PARTIALLY_RESOLVED"
+    STATE_RESOLVED = "RESOLVED"
+    STATE_ABORTED = "ABORTED"
+
+    STAGE_CHOOSE_INSTANCE = "CHOOSE_INSTANCE"
+    STAGE_CHOOSE_SUBPART = "CHOOSE_SUBPART"
+    STAGE_CHOOSE_ATTRIBUTE = "CHOOSE_ATTRIBUTE"
+    STAGE_CONFIRM = "CONFIRM"
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.state = self.STATE_IDLE
+        self.stage = None
+        self.candidates = []
+        self.constraints = {"location": None, "subpart": None, "attribute": None}
+        self.resolved = {"target_object_id": None}
+        self.history = []
+
+    def start_ambiguity(self, candidates, stage=None):
+        self.state = self.STATE_AMBIGUITY_DETECTED
+        self.candidates = candidates or []
+        self.stage = stage or self.STAGE_CHOOSE_INSTANCE
+        # Minimal log for traceability across ambiguity sessions.
+        print(f"[MCP] State={self.state}, Stage={self.stage}, Candidates={len(self.candidates)}")
+
+    def start_clarifying(self):
+        if self.state in [self.STATE_AMBIGUITY_DETECTED, self.STATE_PARTIALLY_RESOLVED]:
+            self.state = self.STATE_CLARIFYING
+            print(f"[MCP] State={self.state}, Stage={self.stage}")
+
+    def update_after_response(self, response, candidates, resolved_obj):
+        # Record response for traceability across clarification turns.
+        self.history.append({
+            "stage": self.stage,
+            "response": response,
+            "candidate_count": len(candidates) if candidates else 0
+        })
+
+        if resolved_obj is not None:
+            self.state = self.STATE_RESOLVED
+            self.resolved["target_object_id"] = resolved_obj.get("objectId")
+        elif candidates and len(candidates) > 1:
+            self.state = self.STATE_PARTIALLY_RESOLVED
+        elif candidates and len(candidates) == 1:
+            self.state = self.STATE_RESOLVED
+            self.resolved["target_object_id"] = candidates[0].get("objectId")
+        else:
+            self.state = self.STATE_ABORTED
+        # Summarize the post-response state for debugging multi-turn flows.
+        print(f"[MCP] Response={response}, State={self.state}, Resolved={self.resolved['target_object_id']}")
+
 class RocAgent(BaseAgent):
     STATE_OBSERVATION = "observation"
     STATE_PLANNING = "planning"
@@ -119,6 +177,9 @@ class RocAgent(BaseAgent):
         # Initialize object indexing
         if self.enable_object_indexing:
             self.init_object_indexing()
+
+        # Multi-turn clarification state tracker (MCP-style)
+        self.mcp_tracker = MCPStateTracker()
         
     def build_agent(self):
         return None, None, None, None
@@ -3277,6 +3338,10 @@ You have {self.human_selection_timeout} seconds to respond.
         print(f"\nStarting ENHANCED disambiguation for {len(candidates)} {itemtype} objects...")
         print(f"Task Context: {getattr(self, 'current_task', 'Not set')}")
         print(f"Disambiguation Mode: {self.disambiguation_mode}")
+
+        # Initialize clarification state for this ambiguity event.
+        self.mcp_tracker.start_ambiguity(candidates, stage=MCPStateTracker.STAGE_CHOOSE_INSTANCE)
+        self.mcp_tracker.start_clarifying()
         
         task_description = getattr(self, 'current_task', f'Navigate to {itemtype}')
         
@@ -3301,7 +3366,10 @@ You have {self.human_selection_timeout} seconds to respond.
                 
                 if choice and choice != 'auto' and choice != 'timeout':
                     print(f"[HUMAN SELECTED] Using human choice: {choice}")
-                    return self.get_object_by_choice(choice, analyses)
+                    selected = self.get_object_by_choice(choice, analyses)
+                    # Log human-driven resolution for audit and replay.
+                    self.mcp_tracker.update_after_response(choice, analyses, selected)
+                    return selected
                 else:
                     print("[TIMEOUT/AUTO] Human selection timed out, falling back to VLM analysis...")
                     # Fallback: Run VLM analysis on the photos we already took
@@ -3312,13 +3380,18 @@ You have {self.human_selection_timeout} seconds to respond.
 
                     # If VLM analysis produces valid results, use them
                     if vlm_analyses and any(analysis.get('confidence', 0) > 25 for analysis in vlm_analyses):
-                        return self.select_best_candidate_from_vlm(vlm_analyses, itemtype)
+                        selected = self.select_best_candidate_from_vlm(vlm_analyses, itemtype)
+                        # Log VLM-driven resolution for audit and replay.
+                        self.mcp_tracker.update_after_response("auto_vlm", vlm_analyses, selected)
+                        return selected
                     else:
                         # VLM failed, randomly select a candidate
                         import random
                         selected = random.choice(candidates)
                         selected_index = candidates.index(selected) + 1
                         print(f"[FALLBACK] VLM analysis failed, randomly selecting {itemtype}_{selected_index}")
+                        # Log random fallback selection to capture degraded behavior.
+                        self.mcp_tracker.update_after_response("auto_random", candidates, selected)
                         return selected
 
             except Exception as e:
@@ -3327,6 +3400,8 @@ You have {self.human_selection_timeout} seconds to respond.
                 selected = random.choice(candidates)
                 selected_index = candidates.index(selected) + 1
                 print(f"[FALLBACK] Randomly selecting {itemtype}_{selected_index}")
+                # Log random fallback selection to capture degraded behavior.
+                self.mcp_tracker.update_after_response("auto_random", candidates, selected)
                 return selected
 
         elif self.disambiguation_mode == "vlm_first_human_choice":
@@ -3340,6 +3415,8 @@ You have {self.human_selection_timeout} seconds to respond.
                 selected = random.choice(candidates)
                 selected_index = candidates.index(selected) + 1
                 print(f"[FALLBACK] VLM analysis failed, randomly selecting {itemtype}_{selected_index}")
+                # Log random fallback selection to capture degraded behavior.
+                self.mcp_tracker.update_after_response("auto_random", candidates, selected)
                 return selected
 
             # Update Web UI with VLM confidence scores immediately
@@ -3360,11 +3437,17 @@ You have {self.human_selection_timeout} seconds to respond.
 
             if choice and choice != 'auto' and choice != 'timeout':
                 print(f"[HUMAN SELECTED] Using human choice: {choice}")
-                return self.get_object_by_choice(choice, analyses)
+                selected = self.get_object_by_choice(choice, analyses)
+                # Log human-driven resolution for audit and replay.
+                self.mcp_tracker.update_after_response(choice, analyses, selected)
+                return selected
             else:
                 # Human didn't select, use VLM recommendation
                 print("[AUTO] Human didn't select, using VLM recommendation...")
-                return self.select_best_candidate_from_vlm(analyses, itemtype)
+                selected = self.select_best_candidate_from_vlm(analyses, itemtype)
+                # Log VLM-driven resolution for audit and replay.
+                self.mcp_tracker.update_after_response("auto_vlm", analyses, selected)
+                return selected
 
         elif self.disambiguation_mode == "human_only_random_fallback":
             # Mode 3: Human only, random selection as fallback
@@ -3386,7 +3469,10 @@ You have {self.human_selection_timeout} seconds to respond.
 
             if choice and choice != 'auto' and choice != 'timeout':
                 print(f"[HUMAN SELECTED] Using human choice: {choice}")
-                return self.get_object_by_choice(choice, analyses)
+                selected = self.get_object_by_choice(choice, analyses)
+                # Log human-driven resolution for audit and replay.
+                self.mcp_tracker.update_after_response(choice, analyses, selected)
+                return selected
             else:
                 # Human didn't select, random fallback (no VLM)
                 print("[RANDOM FALLBACK] Human selection timed out, randomly selecting...")
@@ -3394,6 +3480,8 @@ You have {self.human_selection_timeout} seconds to respond.
                 selected = random.choice(candidates)
                 selected_index = candidates.index(selected) + 1
                 print(f"[RANDOM] Randomly selected {itemtype}_{selected_index}")
+                # Log random fallback selection to capture degraded behavior.
+                self.mcp_tracker.update_after_response("auto_random", candidates, selected)
                 return selected
 
         else:
@@ -3404,6 +3492,8 @@ You have {self.human_selection_timeout} seconds to respond.
             selected = random.choice(candidates)
             selected_index = candidates.index(selected) + 1
             print(f"[RANDOM] Randomly selected {itemtype}_{selected_index}")
+            # Log random fallback selection to capture degraded behavior.
+            self.mcp_tracker.update_after_response("auto_random", candidates, selected)
             return selected
 
     def update_web_ui_disambiguation_history(self, vlm_analyses, task_description, itemtype):
