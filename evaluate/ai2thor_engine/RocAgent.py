@@ -3343,7 +3343,17 @@ You have {self.human_selection_timeout} seconds to respond.
         self.mcp_tracker.start_ambiguity(candidates, stage=MCPStateTracker.STAGE_CHOOSE_INSTANCE)
         self.mcp_tracker.start_clarifying()
         
-        task_description = getattr(self, 'current_task', f'Navigate to {itemtype}')
+        # Prefer explicit task context for constraint parsing if available.
+        task_description = (
+            getattr(self, 'current_task', None)
+            or getattr(self, 'current_task_description', None)
+            or f'Navigate to {itemtype}'
+        )
+        # Parse attribute constraints (color/open/size) from task text.
+        constraints = self.parse_attribute_constraints(task_description)
+        self.mcp_tracker.constraints["attribute"] = constraints
+        # Apply metadata-based filtering (open/size) before any VLM usage.
+        candidates = self.filter_candidates_by_constraints(candidates, constraints)
         
         if self.disambiguation_mode == "human_first_vlm_fallback":
             # Mode 1: Human-first with VLM fallback
@@ -3353,7 +3363,11 @@ You have {self.human_selection_timeout} seconds to respond.
             if analyses is None or all(a['analysis_quality'] == 'navigation_failed' for a in analyses):
                 print(f"[FALLBACK] Photo capture failed, using first object: {itemtype}")
                 return candidates[0]
-            
+
+            # Color filtering uses VLM on captured photos when needed.
+            analyses = self.filter_analyses_by_color_constraint(analyses, constraints)
+            candidates = [analysis['object'] for analysis in analyses]
+
             # Generate visual message for human selection
             message, comparison_path = self.generate_visual_disambiguation_message(candidates, analyses)
             self.comparison_path = comparison_path
@@ -3419,6 +3433,10 @@ You have {self.human_selection_timeout} seconds to respond.
                 self.mcp_tracker.update_after_response("auto_random", candidates, selected)
                 return selected
 
+            # Color filtering uses VLM on captured photos when needed.
+            analyses = self.filter_analyses_by_color_constraint(analyses, constraints)
+            candidates = [analysis['object'] for analysis in analyses]
+
             # Update Web UI with VLM confidence scores immediately
             self.update_web_ui_disambiguation_history(analyses, task_description, itemtype)
 
@@ -3457,6 +3475,10 @@ You have {self.human_selection_timeout} seconds to respond.
             if analyses is None or all(a['analysis_quality'] == 'navigation_failed' for a in analyses):
                 print(f"[FALLBACK] Photo capture failed, using first object: {itemtype}")
                 return candidates[0]
+
+            # Color filtering uses VLM on captured photos when needed.
+            analyses = self.filter_analyses_by_color_constraint(analyses, constraints)
+            candidates = [analysis['object'] for analysis in analyses]
 
             # Generate visual message for human selection (no VLM confidence scores)
             message, comparison_path = self.generate_visual_disambiguation_message(candidates, analyses)
@@ -3548,6 +3570,162 @@ You have {self.human_selection_timeout} seconds to respond.
 
         except Exception as e:
             print(f"[WARNING] Error updating Web UI disambiguation history: {e}")
+
+    def parse_attribute_constraints(self, text):
+        """Parse simple attribute constraints from task text."""
+        # Keep constraints lightweight and keyword-based for now.
+        constraints = {"color": None, "open_state": None, "size": None}
+        if not text:
+            return constraints
+
+        text_lower = text.lower()
+        color_keywords = [
+            ("red", ["red", "红", "紅"]),
+            ("green", ["green", "绿", "綠"]),
+            ("blue", ["blue", "蓝", "藍"]),
+            ("yellow", ["yellow", "黄", "黃"]),
+            ("black", ["black", "黑"]),
+            ("white", ["white", "白"]),
+            ("brown", ["brown", "棕", "褐"]),
+            ("gray", ["gray", "grey", "灰"]),
+            ("orange", ["orange", "橙"]),
+            ("purple", ["purple", "紫"]),
+        ]
+        for color, keywords in color_keywords:
+            if any(k in text_lower or k in text for k in keywords):
+                constraints["color"] = color
+                break
+
+        # Disambiguate open/closed intent from task text.
+        open_keywords = ["open", "opened", "opening", "开着", "打开", "开启"]
+        closed_keywords = ["closed", "close", "shut", "关着", "关闭", "关上", "合上"]
+        is_open = any(k in text_lower or k in text for k in open_keywords)
+        is_closed = any(k in text_lower or k in text for k in closed_keywords)
+        if is_open and not is_closed:
+            constraints["open_state"] = "open"
+        elif is_closed and not is_open:
+            constraints["open_state"] = "closed"
+
+        # Size keywords map to either volume or height constraints.
+        size_keywords = [
+            ("tall", ["tall", "高"]),
+            ("short", ["short", "矮"]),
+            ("large", ["large", "big", "larger", "bigger", "大", "更大"]),
+            ("small", ["small", "little", "smaller", "小", "更小"]),
+            ("medium", ["medium", "middle", "中", "适中"]),
+        ]
+        for size, keywords in size_keywords:
+            if any(k in text_lower or k in text for k in keywords):
+                constraints["size"] = size
+                break
+
+        return constraints
+
+    def filter_candidates_by_constraints(self, candidates, constraints):
+        """Filter candidates based on simple metadata constraints (open/size)."""
+        # Filter softly: only apply when it doesn't empty the candidate set.
+        if not constraints or not candidates:
+            return candidates
+
+        filtered = list(candidates)
+
+        if constraints.get("open_state"):
+            target_open = constraints["open_state"] == "open"
+            # Only openable objects can be filtered by open/closed state.
+            open_filtered = [
+                obj for obj in filtered
+                if obj.get("openable", False) and obj.get("isOpen", False) == target_open
+            ]
+            if open_filtered:
+                filtered = open_filtered
+
+        size_constraint = constraints.get("size")
+        if size_constraint and len(filtered) > 1:
+            metric_key = "height" if size_constraint in ("tall", "short") else "volume"
+            metrics = []
+            for obj in filtered:
+                try:
+                    # Use AABB size to derive height or volume for ranking.
+                    size = obj["axisAlignedBoundingBox"]["size"]
+                    volume = size["x"] * size["y"] * size["z"]
+                    height = size["y"]
+                    metrics.append((obj, height if metric_key == "height" else volume))
+                except Exception:
+                    continue
+
+            if len(metrics) >= 2:
+                metrics.sort(key=lambda m: m[1])
+                half = max(1, len(metrics) // 2)
+                # Use top/bottom half split as a lightweight size filter.
+                if size_constraint in ("large", "tall"):
+                    filtered = [obj for obj, _ in metrics[-half:]]
+                elif size_constraint in ("small", "short"):
+                    filtered = [obj for obj, _ in metrics[:half]]
+
+        return filtered if filtered else candidates
+
+    def filter_analyses_by_color_constraint(self, analyses, constraints):
+        """Filter analyses by color constraint using VLM if needed."""
+        # Only attempt color filtering when explicitly requested.
+        if not analyses or not constraints or not constraints.get("color"):
+            return analyses
+
+        target_color = constraints["color"]
+        for analysis in analyses:
+            if analysis.get("color") or not analysis.get("image_path"):
+                continue
+            obj_type = analysis.get("object", {}).get("objectType", "object")
+            # Infer color per candidate image via VLM.
+            color = self.infer_color_from_image(analysis["image_path"], obj_type, analysis.get("index", 0))
+            if color:
+                analysis["color"] = color
+
+        matched = [analysis for analysis in analyses if analysis.get("color") == target_color]
+        if not matched:
+            return analyses
+
+        # Reindex to keep UI/selection consistent with filtered list.
+        for idx, analysis in enumerate(matched):
+            analysis["index"] = idx + 1
+        return matched
+
+    def infer_color_from_image(self, image_path, obj_type, candidate_index):
+        """Infer dominant color from a candidate image using VLM."""
+        # Keep prompt constrained to fixed color labels for stable parsing.
+        prompt = (
+            f"You are identifying the dominant color of a {obj_type}.\n"
+            "Return exactly one of: red, green, blue, yellow, black, white, brown, gray, orange, purple.\n"
+            "Respond with only the color word."
+        )
+        try:
+            response = self.vlm_call_with_logging(image_path, prompt, analysis_type="color_detection")
+        except Exception as e:
+            print(f"[WARNING] Color detection failed for {obj_type}_{candidate_index}: {e}")
+            return None
+        return self.extract_color_from_response(response)
+
+    def extract_color_from_response(self, response):
+        """Normalize a VLM color response to a known color token."""
+        # Normalize both English and Chinese color mentions.
+        if not response:
+            return None
+        text = response.lower()
+        color_map = {
+            "red": ["red", "红", "紅"],
+            "green": ["green", "绿", "綠"],
+            "blue": ["blue", "蓝", "藍"],
+            "yellow": ["yellow", "黄", "黃"],
+            "black": ["black", "黑"],
+            "white": ["white", "白"],
+            "brown": ["brown", "棕", "褐"],
+            "gray": ["gray", "grey", "灰"],
+            "orange": ["orange", "橙"],
+            "purple": ["purple", "紫"],
+        }
+        for color, tokens in color_map.items():
+            if any(token in text for token in tokens):
+                return color
+        return None
 
     # ==================== ENHANCED FEATURES INITIALIZATION ====================
     
