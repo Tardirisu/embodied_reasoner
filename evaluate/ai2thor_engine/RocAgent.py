@@ -107,6 +107,9 @@ class RocAgent(BaseAgent):
         self.confidence_gap_threshold = 30      # Auto-select if confidence gap > 30%
         self.current_task_description = ""      # Set by task context
         self.current_gpt4o_reasoning = ""       # Store GPT-4o reasoning for VLM prompts
+        self.use_depth_centroid = True          # Use depth/point-cloud centroid in spatial signature when available
+        self._depth_centroid_logged = False
+        self._depth_centroid_fallback_logged = False
         
         # Disambiguation mode configuration
         self.disambiguation_mode = "human_only_random_fallback"
@@ -1208,14 +1211,28 @@ class RocAgent(BaseAgent):
     def build_spatial_signature(self, obj, grid_size=0.25):
         """Build a stable spatial signature using grid, centroid, size, and rotation."""
         position = obj.get("position", {})
+        depth_centroid = self._get_depth_centroid(obj) if self.use_depth_centroid else None
         rotation = obj.get("rotation", {})
         size = self._get_object_size(obj)
         grid = self._get_grid_cell(position, grid_size)
-        centroid = (
-            round(position.get("x", 0.0), 2),
-            round(position.get("y", 0.0), 2),
-            round(position.get("z", 0.0), 2),
-        )
+        if depth_centroid is None:
+            if self.use_depth_centroid and not self._depth_centroid_fallback_logged:
+                print("[DepthCentroid] Unavailable, falling back to metadata position.")
+                self._depth_centroid_fallback_logged = True
+            centroid = (
+                round(position.get("x", 0.0), 2),
+                round(position.get("y", 0.0), 2),
+                round(position.get("z", 0.0), 2),
+            )
+        else:
+            if self.use_depth_centroid and not self._depth_centroid_logged:
+                print("[DepthCentroid] Using depth-based centroid for spatial signature.")
+                self._depth_centroid_logged = True
+            centroid = (
+                round(depth_centroid[0], 2),
+                round(depth_centroid[1], 2),
+                round(depth_centroid[2], 2),
+            )
         rot = (
             round(rotation.get("x", 0.0), 1),
             round(rotation.get("y", 0.0), 1),
@@ -1246,6 +1263,53 @@ class RocAgent(BaseAgent):
         if isinstance(bb, dict) and "size" in bb:
             return bb["size"]
         return {"x": 0.0, "y": 0.0, "z": 0.0}
+
+    def _get_depth_centroid(self, obj, max_points=5000):
+        """Compute centroid from depth + instance mask when available."""
+        event = self.controller.last_event
+        depth = getattr(event, "depth_frame", None)
+        masks = getattr(event, "instance_masks", None)
+        if depth is None or masks is None:
+            return None
+        obj_id = obj.get("objectId")
+        if obj_id is None or obj_id not in masks:
+            return None
+        mask = masks[obj_id]
+        if mask is None or mask.shape != depth.shape:
+            return None
+        ys, xs = np.where(mask)
+        if ys.size == 0:
+            return None
+        if ys.size > max_points:
+            idx = np.random.choice(ys.size, max_points, replace=False)
+            ys = ys[idx]
+            xs = xs[idx]
+        z = depth[ys, xs]
+        # Filter out invalid depth values
+        valid = np.isfinite(z) & (z > 0)
+        if not np.any(valid):
+            return None
+        ys = ys[valid]
+        xs = xs[valid]
+        z = z[valid]
+        h, w = depth.shape
+        intrinsics = event.metadata.get("cameraIntrinsicMatrix")
+        if isinstance(intrinsics, list) and len(intrinsics) == 3:
+            fx = intrinsics[0][0]
+            fy = intrinsics[1][1]
+            cx = intrinsics[0][2]
+            cy = intrinsics[1][2]
+        else:
+            fov = event.metadata.get("cameraFieldOfView", 90)
+            f = 0.5 * w / math.tan(math.radians(fov) / 2.0)
+            fx = f
+            fy = f
+            cx = (w - 1) / 2.0
+            cy = (h - 1) / 2.0
+        x = (xs - cx) / fx * z
+        y = (ys - cy) / fy * z
+        # Camera-space centroid; world transform is not applied here.
+        return (float(np.mean(x)), float(np.mean(y)), float(np.mean(z)))
     
     def generate_spatial_description(self, obj, idx, all_objects):
         """Generate human-readable spatial description"""
