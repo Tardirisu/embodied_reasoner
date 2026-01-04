@@ -1163,29 +1163,39 @@ class RocAgent(BaseAgent):
     # ======= ENHANCED NAVIGATION: Multi-object Disambiguation System =======
     
     def init_object_indexing(self):
-        """Create indexed mapping for duplicate objects with position-based deduplication"""
+        """Create indexed mapping for duplicate objects with layered deduplication."""
         self.objecttype2indexed = {}
         
         for obj_type, objects in self.objecttype2object.items():
             if len(objects) > 1:
-                # Deduplicate objects at the same position (AI2-THOR bug workaround)
-                position_to_obj = {}
+                # Step 1: Deduplicate objects with a stable spatial signature
+                signature_to_obj = {}
                 for obj in objects:
-                    # Round position to handle floating point precision issues
+                    signature = self.build_spatial_signature(obj)
+                    if signature not in signature_to_obj:
+                        signature_to_obj[signature] = obj
+
+                # Step 2: Deduplicate objects at the same position (AI2-THOR bug workaround)
+                position_to_obj = {}
+                for obj in signature_to_obj.values():
                     pos_key = (round(obj['position']['x'], 2), round(obj['position']['z'], 2))
                     if pos_key not in position_to_obj:
                         position_to_obj[pos_key] = obj
                 
-                # Sort deduplicated objects by position for consistent ordering
+                # Sort deduplicated objects by spatial signature for consistent ordering
                 unique_objects = list(position_to_obj.values())
-                sorted_objs = sorted(unique_objects, key=lambda o: (o['position']['x'], o['position']['z']))
+                sorted_objs = sorted(unique_objects, key=self.build_spatial_signature)
                 
                 # Only index if we still have multiple unique positions after deduplication
                 if len(sorted_objs) > 1:
                     for i, obj in enumerate(sorted_objs):
                         indexed_name = f"{obj_type}_{i+1}"
                         self.objecttype2indexed[indexed_name] = obj
-                        print(f"Object indexing: {indexed_name} at position ({obj['position']['x']:.2f}, {obj['position']['z']:.2f})")
+                        print(
+                            f"Object indexing: {indexed_name} at position "
+                            f"({obj['position']['x']:.2f}, {obj['position']['z']:.2f}) "
+                            f"signature={self.build_spatial_signature(obj)}"
+                        )
                 else:
                     # All objects were at same position - just use the first one
                     print(f"Deduplication: {len(objects)} {obj_type} objects collapsed to 1 unique position")
@@ -1194,6 +1204,48 @@ class RocAgent(BaseAgent):
                 obj = objects[0]
                 indexed_name = f"{obj_type}_1"
                 self.objecttype2indexed[indexed_name] = obj
+
+    def build_spatial_signature(self, obj, grid_size=0.25):
+        """Build a stable spatial signature using grid, centroid, size, and rotation."""
+        position = obj.get("position", {})
+        rotation = obj.get("rotation", {})
+        size = self._get_object_size(obj)
+        grid = self._get_grid_cell(position, grid_size)
+        centroid = (
+            round(position.get("x", 0.0), 2),
+            round(position.get("y", 0.0), 2),
+            round(position.get("z", 0.0), 2),
+        )
+        rot = (
+            round(rotation.get("x", 0.0), 1),
+            round(rotation.get("y", 0.0), 1),
+            round(rotation.get("z", 0.0), 1),
+        )
+        size_key = (
+            round(size.get("x", 0.0), 2),
+            round(size.get("y", 0.0), 2),
+            round(size.get("z", 0.0), 2),
+        )
+        return f"g{grid}_c{centroid}_r{rot}_s{size_key}"
+
+    def _get_grid_cell(self, position, grid_size):
+        """Coarse grid binning for spatial disambiguation."""
+        x = position.get("x", 0.0)
+        z = position.get("z", 0.0)
+        return (int(round(x / grid_size)), int(round(z / grid_size)))
+
+    def _get_object_size(self, obj):
+        """Get object size from metadata, with safe fallbacks."""
+        aabb = obj.get("axisAlignedBoundingBox", {})
+        if isinstance(aabb, dict) and "size" in aabb:
+            return aabb["size"]
+        obb = obj.get("objectOrientedBoundingBox", {})
+        if isinstance(obb, dict) and "size" in obb:
+            return obb["size"]
+        bb = obj.get("boundingBox", {})
+        if isinstance(bb, dict) and "size" in bb:
+            return bb["size"]
+        return {"x": 0.0, "y": 0.0, "z": 0.0}
     
     def generate_spatial_description(self, obj, idx, all_objects):
         """Generate human-readable spatial description"""
