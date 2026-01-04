@@ -21,10 +21,16 @@ except ImportError as e:
     def log_task_start(data): pass
     def log_task_complete(success, data=None): pass 
     def log_interaction(data): pass
-MODE = "LOCAL" # choose ["LOCAL","API"]
+MODE = os.getenv("EVAL_MODE", "LOCAL")  # choose ["LOCAL","API"]
 PLATFORM_TYPE="GPU" 
 
 MAX_MODEL_INFER_COUNT=3
+
+def _get_ai2thor_platform():
+    platform_name = os.getenv("AI2THOR_PLATFORM", "auto").lower()
+    if platform_name in ("cloud", "cloudrendering"):
+        return CloudRendering
+    return None
 def load_data(args):
     cache = {}
     prefix_path = f"./data/{args.model_name}"
@@ -408,21 +414,24 @@ if __name__ == "__main__":
 
         success_count = 0
         # controller = None
-        controller = Controller(
-            platform=CloudRendering,
-            snapToGrid=False,
-            quality='Medium',
-            agentMode="default",
-            massThreshold=None,
-            scene='FloorPlan1',
-            visibilityDistance=20,
-            gridSize=0.1,
-            renderDepthImage=False,
-            renderInstanceSegmentation=True,
-            width=800,
-            height=450,
-            fieldOfView=90,
-        )
+        platform = _get_ai2thor_platform()
+        controller_kwargs = {
+            "snapToGrid": False,
+            "quality": "Medium",
+            "agentMode": "default",
+            "massThreshold": None,
+            "scene": "FloorPlan1",
+            "visibilityDistance": 20,
+            "gridSize": 0.1,
+            "renderDepthImage": False,
+            "renderInstanceSegmentation": True,
+            "width": 800,
+            "height": 450,
+            "fieldOfView": 90,
+        }
+        if platform is not None:
+            controller_kwargs["platform"] = platform
+        controller = Controller(**controller_kwargs)
         for test_data in tqdm(data):
             try:
                 result_file = f"./data/{args.model_name}/{test_data['identity']}_{test_data['tasktype']}_{test_data['scene']}_{test_data['instruction_idx']}/result.json"
@@ -452,11 +461,11 @@ if __name__ == "__main__":
     
     
     elif MODE=="API":
-        match_item_model="gpt-4o-mini"
+        default_model_name = os.getenv("EVAL_MODEL_NAME", "gpt-4o-mini")
         
         parser = argparse.ArgumentParser()
         parser.add_argument("--input_path", type=str, default="./data/test_809.json", help="input file path")
-        parser.add_argument("--model_name", type=str, default="gpt-4o-mini", help="")
+        parser.add_argument("--model_name", type=str, default=default_model_name, help="")
         parser.add_argument("--batch_size", type=int, default=200, help="")
         parser.add_argument("--port", type=int, default=10000, help="")
         parser.add_argument("--cur_count", type=int, default=1, help="")
@@ -466,6 +475,7 @@ if __name__ == "__main__":
         parser.add_argument("--no_dashboard", action="store_true", help="Disable web dashboard (only applies to dialogue mode)")
         args = parser.parse_args()
         print(args)
+        match_item_model = os.getenv("EVAL_MATCH_MODEL", args.model_name)
         
         data = load_data(args)
         
@@ -524,21 +534,24 @@ if __name__ == "__main__":
             exit(0)
         success_count = 0
         
-        controller = Controller(
-            platform=CloudRendering,
-            snapToGrid=False,
-            quality='Medium',
-            agentMode="default",
-            massThreshold=None,
-            scene='FloorPlan1',
-            visibilityDistance=20,
-            gridSize=0.1,
-            renderDepthImage=False,
-            renderInstanceSegmentation=True,
-            width=800,
-            height=450,
-            fieldOfView=90,
-        )
+        platform = _get_ai2thor_platform()
+        controller_kwargs = {
+            "snapToGrid": False,
+            "quality": "Medium",
+            "agentMode": "default",
+            "massThreshold": None,
+            "scene": "FloorPlan1",
+            "visibilityDistance": 20,
+            "gridSize": 0.1,
+            "renderDepthImage": False,
+            "renderInstanceSegmentation": True,
+            "width": 800,
+            "height": 450,
+            "fieldOfView": 90,
+        }
+        if platform is not None:
+            controller_kwargs["platform"] = platform
+        controller = Controller(**controller_kwargs)
         
         for test_data in tqdm(data):
             try:

@@ -1,4 +1,5 @@
 import math
+import os
 try:
     from utils import *
 except Exception as e:
@@ -177,6 +178,7 @@ class RocAgent(BaseAgent):
         # Initialize object indexing
         if self.enable_object_indexing:
             self.init_object_indexing()
+        self.debug_print_object_hierarchy()
 
         # Multi-turn clarification state tracker (MCP-style)
         self.mcp_tracker = MCPStateTracker()
@@ -1255,6 +1257,28 @@ class RocAgent(BaseAgent):
                 obj = objects[0]
                 indexed_name = f"{obj_type}_1"
                 self.objecttype2indexed[indexed_name] = obj
+
+    def debug_print_object_hierarchy(self, max_children=10):
+        """Print container -> child object hierarchy from AI2-THOR metadata."""
+        objects = self.controller.last_event.metadata.get("objects", [])
+        object_by_id = {obj["objectId"]: obj for obj in objects if "objectId" in obj}
+        print("Object hierarchy (receptacleObjectIds):")
+        for obj in objects:
+            if not obj.get("receptacle", False):
+                continue
+            child_ids = obj.get("receptacleObjectIds") or []
+            if not child_ids:
+                continue
+            child_types = []
+            for child_id in child_ids[:max_children]:
+                child_obj = object_by_id.get(child_id)
+                if child_obj:
+                    child_types.append(child_obj.get("objectType", "Unknown"))
+                else:
+                    child_types.append("Unknown")
+            truncated = len(child_ids) - len(child_types)
+            suffix = f" (+{truncated} more)" if truncated > 0 else ""
+            print(f"- {obj.get('objectType','Unknown')} ({obj.get('objectId','?')}): {child_types}{suffix}")
     
     def generate_spatial_description(self, obj, idx, all_objects):
         """Generate human-readable spatial description"""
@@ -1354,15 +1378,31 @@ class RocAgent(BaseAgent):
 
     def _execute_vlm_request(self, image_path, prompt):
         """Pure VLM execution without logging - core functionality with retry"""
-        import sys
         import os
         import time
-        sys.path.append(os.path.dirname(os.path.dirname(__file__)))
-        from VLMCall import VLMAPI
-        
-        vlm = VLMAPI("Qwen/Qwen2-VL-7B-Instruct")
-        
-        img_url = vlm.encode_image_2(image_path)
+        import base64
+        import mimetypes
+        try:
+            from openai import OpenAI
+        except Exception as e:
+            raise RuntimeError(f"OpenAI client not available: {e}")
+
+        api_key = os.environ.get("MODELSCOPE_API_KEY")
+        if not api_key:
+            raise RuntimeError("MODELSCOPE_API_KEY is not set")
+        base_url = os.environ.get(
+            "MODELSCOPE_BASE_URL",
+            "https://ms-ens-6e0791fc-49a0.api-inference.modelscope.cn/v1"
+        )
+        model_id = os.environ.get("MODELSCOPE_MODEL_ID", "Qwen/Qwen2-VL-2B-Instruct")
+        prompt = self._sanitize_vlm_prompt(prompt)
+
+        mime_type = mimetypes.guess_type(image_path)[0] or "image/jpeg"
+        with open(image_path, "rb") as f:
+            encoded = base64.b64encode(f.read()).decode("ascii")
+        img_url = f"data:{mime_type};base64,{encoded}"
+
+        client = OpenAI(base_url=base_url, api_key=api_key)
         messages = [
             {"role": "system", "content": "You are a household navigation agent analyzing scenes for task completion."},
             {
@@ -1380,7 +1420,13 @@ class RocAgent(BaseAgent):
                 if attempt > 0:
                     print(f"Retry: {attempt+1} times)")
                     time.sleep(2)
-                return vlm.vlm_request(messages)
+                response = client.chat.completions.create(
+                    model=model_id,
+                    messages=messages,
+                    stream=False
+                )
+                content = response.choices[0].message.content if response.choices else ""
+                return content or ""
             except Exception as e:
                 # Check if it's a 400 error (client error) - don't retry
                 error_str = str(e)
@@ -1392,6 +1438,29 @@ class RocAgent(BaseAgent):
                 if attempt == 2:
                     print(f"VLM anaylsis failed after 3 attempts - {e}")
                     raise e
+
+    def _sanitize_vlm_prompt(self, prompt):
+        """Normalize prompts to ASCII to avoid client encoding errors."""
+        if not isinstance(prompt, str):
+            prompt = str(prompt)
+        replacements = {
+            "“": "\"",
+            "”": "\"",
+            "‘": "'",
+            "’": "'",
+            "—": "-",
+            "–": "-",
+            "…": "...",
+            "•": "*",
+        }
+        for src, dst in replacements.items():
+            if src in prompt:
+                prompt = prompt.replace(src, dst)
+        try:
+            prompt.encode("ascii")
+        except UnicodeEncodeError:
+            prompt = prompt.encode("ascii", "ignore").decode("ascii")
+        return prompt
     
     # Maintain backward compatible old interface
     def vlm_call(self, image_path, prompt):

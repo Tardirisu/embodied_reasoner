@@ -1,5 +1,6 @@
 MODEL_PATH=$1
 MODEL_NAME=$2
+PYTHON_BIN=${PYTHON:-python3}
 
 # image_resolution
 export IMAGE_RESOLUTION=351232
@@ -11,12 +12,12 @@ export PYTHONUNBUFFERED=1
 # export NCCL_P2P_DISABLE=1
 
 # embedding model for match object
-python ./inference/local_deploy.py \
+$PYTHON_BIN ./inference/local_deploy.py \
     --embedding 1 \
     --port 20000 &
 
 # vison language model inference server
-CUDA_VISIBLE_DEVICES=1 python inference/local_deploy.py \
+CUDA_VISIBLE_DEVICES=1 $PYTHON_BIN inference/local_deploy.py \
     --frame "hf" \
     --model_type $MODEL_TYPE \
     --model_name $MODEL_PATH \
@@ -32,7 +33,7 @@ while ! nc -z localhost 10001; do
 done
 
 # start ai2thor engine and request inference server
-CUDA_VISIBLE_DEVICES=0 python evaluate/evaluate.py \
+CUDA_VISIBLE_DEVICES=0 $PYTHON_BIN evaluate/evaluate.py \
         --model_name $MODEL_NAME \
         --input_path "data/test_809.json" \
         --batch_size 200 \
@@ -42,5 +43,5 @@ CUDA_VISIBLE_DEVICES=0 python evaluate/evaluate.py \
 
 wait 
 
-python evaluate/show_result.py \
+$PYTHON_BIN evaluate/show_result.py \
     --model_name $MODEL_NAME

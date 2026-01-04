@@ -10,9 +10,14 @@ import io
 import matplotlib.pyplot as plt
 from openai import OpenAI, AzureOpenAI, APIError
 import time
+import os
 
 
-from VLMCallapi_keys import moda_keys,api_keys
+try:
+    from VLMCallapi_keys import moda_keys, api_keys
+except Exception:
+    moda_keys = []
+    api_keys = []
     
 class VLMRequestError(Exception):
     pass  
@@ -21,7 +26,8 @@ class VLMRequestError(Exception):
 moda_models=[
     "Qwen/Qwen2.5-72B-Instruct",
     "Qwen/Qwen2.5-VL-7B-Instruct",
-    "Qwen/Qwen2-VL-7B-Instruct"
+    "Qwen/Qwen2-VL-7B-Instruct",
+    "Qwen/Qwen2-VL-2B-Instruct"
 ]
 
 openai_models=[
@@ -34,6 +40,20 @@ openai_models=[
 class VLMAPI:
     def __init__(self,model):#gpt-4o-2024-11-20,gpt-4o-mini
         self.model=model
+
+    def _sanitize_api_key(self, api_key, source):
+        """Ensure API key is ASCII-safe for HTTP headers."""
+        if api_key is None:
+            return api_key
+        api_key = api_key.strip()
+        try:
+            api_key.encode("ascii")
+        except UnicodeEncodeError:
+            raise VLMRequestError(
+                f"API key from {source} contains non-ASCII characters; "
+                "please remove any non-ASCII characters or whitespace."
+            )
+        return api_key
         
 
     def vlm_request(self,
@@ -52,6 +72,7 @@ class VLMAPI:
                     print(f"********* start call {self.model} *********")
                     
                     api_key = random.choice(api_keys)
+                    api_key = self._sanitize_api_key(api_key, "api_keys")
                     # 钱多多API平台配置
                     client = OpenAI(
                         api_key=api_key,
@@ -105,10 +126,16 @@ class VLMAPI:
                     # import pdb;pdb.set_trace()
                     print(f"********* start call {self.model} *********")
                     
-                    api_key=random.choice(moda_keys)
+                    api_key = os.getenv("MODELSCOPE_API_KEY")
+                    if not api_key:
+                        if not moda_keys:
+                            raise VLMRequestError("MODELSCOPE_API_KEY is not set and no moda_keys are available.")
+                        api_key = random.choice(moda_keys)
+                    api_key = self._sanitize_api_key(api_key, "MODELSCOPE_API_KEY/moda_keys")
+                    base_url = os.getenv("MODELSCOPE_BASE_URL", "https://api-inference.modelscope.cn/v1")
                     client = OpenAI(
                         api_key=api_key, # 请替换成您的ModelScope SDK Token
-                        base_url="https://api-inference.modelscope.cn/v1"
+                        base_url=base_url
                     )
                     if self.model=="Qwen/Qwen2-VL-7B-Instruct":
                         max_tokens=2000
@@ -178,6 +205,7 @@ class VLMAPI:
             while retry_count < retry_limit: 
                 try:
                     api_key=random.choice(api_keys)
+                    api_key = self._sanitize_api_key(api_key, "api_keys")
                     headers = {
                     'Accept': 'application/json',
                     'Authorization': 'Bearer '+api_key,
@@ -347,7 +375,7 @@ def save_data_to_json(json_data, base_path):
     os.makedirs(os.path.dirname(base_path), exist_ok=True)
 
     try:
-        with open(base_path, "r") as f:
+        with open(base_path, "r", encoding="utf-8") as f:
             existing_data = json.load(f)
             if not isinstance(existing_data, list):
                 existing_data = []
@@ -358,8 +386,8 @@ def save_data_to_json(json_data, base_path):
     existing_data.append(json_data)
 
     # write
-    with open(base_path, "w") as f:
-        json.dump(existing_data, f, indent=4)
+    with open(base_path, "w", encoding="utf-8") as f:
+        json.dump(existing_data, f, indent=4, ensure_ascii=False)
     
     print("save json data to path:",base_path)
 
